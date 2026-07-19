@@ -386,3 +386,250 @@ curl -sS -X POST $AM_URL/agentmemory/smart-search \
 curl -sS -H "Authorization: Bearer $AM_TOKEN" \
      "$AM_URL/agentmemory/memories"
 ```
+
+---
+
+## 13. 核心注意事项（外部 CLI 集成必读）
+
+### 13.1 鉴权不能忘
+所有请求**必须带 Bearer token**，唯一例外是 `/agentmemory/livez`：
+
+```bash
+# 正确
+curl -H "Authorization: Bearer $AM_TOKEN" http://192.168.123.104:3111/agentmemory/memories
+
+# 探活（无 token）
+curl http://192.168.123.104:3111/agentmemory/livez
+```
+
+### 13.2 API 烟测数据在 `hermes-primary` project，不是 `default`
+
+Hermes 写入的数据都在 `project=hermes-primary`。外部客户端查询时**必须带这个 project**，否则搜不到：
+
+```bash
+# 搜 Hermes 的记录 → 必须带 project
+curl -X POST .../smart-search -d '{"query":"YAML", "project":"hermes-primary"}'
+
+# 外部 CLI 用自己的数据 → 用自己的 project 名
+curl -X POST .../smart-search -d '{"query":"YAML", "project":"my-cli-project"}'
+```
+
+### 13.3 写入走 `/observe` 还是 `/remember`？
+
+| Endpoint | 用途 | 特性 |
+|---|---|---|
+| `/observe` | 工具事件、对话记录 | 走 4-tier consolidation，写入到检索有 ~5s 延迟 |
+| `/remember` | 显式保存 insight/decision/pattern | 即时含 embedding，~600ms |
+| `/smart-search` | 语义检索 | 只读 |
+
+- **显式保存**（用户说"记住这个"）→ **`/remember`**
+- **流水记录**（自动捕获对话/工具调用）→ **`/observe`**
+
+### 13.4 查询语义问题
+
+agentmemory 使用 bigmodel embedding-3 做向量化。长中文自然语言查询的语义匹配效果较弱：
+
+```
+"用户偏好什么文件格式" → 0 条 ❌（向量被稀释，BM25 中文分词不匹配）
+"YAML"               → 1 条 ✅
+"文件格式偏好 YAML"  → 1 条 ✅
+```
+
+**建议**：
+- 查询时尽量带关键词：`"YAML 文件格式 偏好"` 优于 `"用户偏好什么文件格式"`
+- 或在客户端做 query expansion（提取关键词后再搜索，参考 Hermes provider 的 `_extract_search_keywords` 实现）
+
+### 13.5 不要写垃圾
+
+每条写入都触发 embedding API 调用（~0.5s + 算力 + 限流）。避免：
+- 大量短 ack（"好的"、"嗯"、"继续"）
+- 低价值工具调用事件（ls、pwd、whoami）
+- 频繁写入触发 consolidation pipeline 空转
+
+**建议阈值**：单条内容 < 200 字不写入。
+
+### 13.6 project 隔离
+
+默认 shared 模式下，所有 project 的 memory 互相可见。如果外部 CLI 要隔离数据，**必须**：
+
+```bash
+# 写入时带自己的 project 名
+curl -X POST .../remember \
+  -d '{"content":"...", "project":"your-project-name", "type":"insight"}'
+
+# 查询时也带同一个 project 名
+curl -X POST .../smart-search \
+  -d '{"query":"...", "project":"your-project-name"}'
+```
+
+否则会和其他项目的数据混在一起，或搜不到自己的数据。
+
+### 13.7 工具数量控制
+
+MCP 模式默认暴露 7 个 core 工具。要解锁全部 53 个工具，在客户端 env 加：
+
+```bash
+AGENTMEMORY_TOOLS=all
+```
+
+但注意：太多工具会让 LLM 选择困难。建议先用 core 7 个，按需开放。也可以用 `AGENTMEMORY_TOOLS=core,memory_graph_query,memory_patterns` 按需白名单。
+
+### 13.8 写入延迟说明
+
+| 操作 | 延迟 | 说明 |
+|---|---|---|
+| GET `/agentmemory/livez` | ~30ms | 探活，无 embedding |
+| POST `/agentmemory/remember` | ~600ms | 含 embedding 调用 |
+| POST `/agentmemory/observe` | ~327ms | 入队后异步 consolidation |
+| POST `/agentmemory/smart-search` | ~94ms | 仅检索，无写入 |
+| 写入到可检索 | ~5s | consolidation pipeline 异步执行 |
+
+如果写入后立刻搜索搜不到，等待几秒后重试。
+
+### 13.9 网络与超时
+
+- NAS 局域网延迟约 1-3ms，embedding 调用增加 ~500ms
+- 建议 HTTP 超时设为 **10s**（避免偶发抖动）
+- 写入失败应**静默丢弃**，不阻塞主流程
+
+### 13.10 安全性
+
+- Bearer token 有权限读写所有数据，**不要泄露**（不要硬编码在公开仓库、日志、截图里）
+- 不要存 API key、密码、token 等机密信息到 memory 库——会被 `smart-search` 返回
+- `memory_governance_delete` 不可逆，没有软删除
+
+---
+
+## 14. 多 CLI 多项目记忆隔离
+
+> **场景**：你有多个 CLI（Claude Code、CodeWhale、OpenCode、Hermes），每个 CLI 可能在不同项目目录下工作。你希望每个项目的记忆自动隔离，互不干扰。
+
+### 14.1 核心思路
+
+固定 `AGENTMEMORY_PROJECT=quantix_rust` 不够灵活——一个 CLI 在不同项目目录下需要不同 project。**自动派生**方案：从 git root 名称派生 project 名。
+
+```
+你在 /home/user/quantix-rust/ 目录工作
+  → git root = "quantix-rust" → AGENTMEMORY_PROJECT=quantix-rust → 记忆隔离
+
+你在 /home/user/myability/ 目录工作
+  → git root = "myability"    → AGENTMEMORY_PROJECT=myability    → 记忆隔离
+```
+
+### 14.2 安装 wrapper 脚本（一行命令）
+
+```bash
+mkdir -p ~/.local/bin && cat > ~/.local/bin/agentmemory-mcp << 'WRAPPER'
+#!/bin/bash
+# agentmemory MCP wrapper — auto-derive project from git root
+# Usage: point all CLI MCP configs to this script instead of npx
+
+# 1. Resolve project: git root name → "quantix-rust" / "myability" / "agentmemory"
+PROJECT="default"
+GIT_TOP=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$GIT_TOP" ]; then
+  PROJECT=$(basename "$GIT_TOP")
+fi
+
+# 2. Allow explicit override (highest priority)
+if [ -n "$AGENTMEMORY_PROJECT" ]; then
+  PROJECT="$AGENTMEMORY_PROJECT"
+fi
+
+# 3. Launch MCP shim with the resolved project
+export AGENTMEMORY_PROJECT="$PROJECT"
+export AGENTMEMORY_URL="${AGENTMEMORY_URL:-http://192.168.123.104:3111}"
+export AGENTMEMORY_SECRET="${AGENTMEMORY_SECRET:-b95898290680a1692d32ac04ee7757e393076231ce6adc6abcf6943bc1026836}"
+
+exec npx -y @agentmemory/mcp "$@"
+WRAPPER
+chmod +x ~/.local/bin/agentmemory-mcp
+```
+
+### 14.3 各 CLI 配置
+
+所有 CLI 统一把 `command` 从 `npx` 改为指向 wrapper：
+
+#### Claude Code / Cursor / Windsurf / Cline / Roo
+
+```json
+{
+  "mcpServers": {
+    "agentmemory": {
+      "command": "~/.local/bin/agentmemory-mcp",
+      "args": [],
+      "env": {
+        "AGENTMEMORY_URL": "http://192.168.123.104:3111",
+        "AGENTMEMORY_SECRET": "b95898290680a1692d32ac04ee7757e393076231ce6adc6abcf6943bc1026836"
+      }
+    }
+  }
+}
+```
+
+#### OpenCode（`opencode.json`）
+
+```json
+{
+  "mcp": {
+    "agentmemory": {
+      "type": "local",
+      "command": ["~/.local/bin/agentmemory-mcp"],
+      "enabled": true,
+      "environment": {
+        "AGENTMEMORY_URL": "http://192.168.123.104:3111",
+        "AGENTMEMORY_SECRET": "b95898290680a1692d32ac04ee7757e393076231ce6adc6abcf6943bc1026836"
+      }
+    }
+  }
+}
+```
+
+#### Hermes（特殊处理）
+
+Hermes 不走 MCP shim（它用 Python memory provider），需要单独配：
+
+**推荐**：Hermes 保持 `AGENTMEMORY_PROJECT=hermes-primary`，负责"对话记忆"。其他 CLI 的 MCP wrapper 自动按项目隔离，负责"项目记忆"。两者互不干扰：
+
+```bash
+# ~/.hermes/.env — 保持不动
+AGENTMEMORY_PROJECT=hermes-primary
+```
+
+如果也希望 Hermes 按项目隔离，启动时手动指定：
+
+```bash
+AGENTMEMORY_PROJECT=quantix-rust hermes
+```
+
+### 14.4 隔离效果矩阵
+
+| 你在哪个目录工作 | 自动派生的 project | 能搜到 Hermes 的对话？ | 能搜到其他项目的？ |
+|---|---|---|---|
+| `quantix-rust/` | `quantix-rust` | ❌ 否（project 不同） | ❌ 否（project 不同） |
+| `myability/` | `myability` | ❌ 否 | ❌ 否 |
+| 显式搜 `project=hermes-primary` | 手动指定 | ✅ 是 | ❌ 否 |
+| 不传 project（默认 shared） | 全部 | ✅ 是 | ✅ 是 |
+
+### 14.5 补充说明
+
+- **非 git 仓库目录**：fallback 为 `project=default`，建议项目初始化到 git 仓库中
+- **显式 override**：设环境变量 `AGENTMEMORY_PROJECT=quantix-rust` 会覆盖自动派生，优先级最高
+- **跨项目查询**：如需跨项目搜索（如架构师审查多个项目），可再加一个独立的 MCP server 配置命名为 `agentmemory-global`，不设 project 限制
+- **wrapper 工作原理**：检测当前工作目录的 git root，取目录名作为 project 值。每个 CLI 工具调用 MCP 工具时，工作目录正是当前项目目录，所以自动派生准确
+
+### 14.6 典型工作流
+
+```
+早上：cd ~/quantix-rust/  → 开 Claude Code
+  → 工具调用自动写入 project=quantix-rust，记忆隔离
+
+下午：cd ~/myability/     → 开 CodeWhale
+  → 工具调用自动写入 project=myability，记忆隔离
+  → 在 myability 里问 "quantix 的 WebSocket 实现"
+  → 主动指定 project=quantix-rust 可查到
+  → 不指定则默认只搜 myability，不会混淆
+
+晚上：Hermes 对话
+  → 写入 hermes-primary，和其他项目完全隔离
+```
